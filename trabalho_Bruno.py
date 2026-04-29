@@ -11,7 +11,7 @@ import anthropic
 # Substitua pela sua chave de API da Anthropic
 # Obtenha em: https://console.anthropic.com/
 # =============================================
-ANTHROPIC_API_KEY = "sua_chave_aqui"
+ANTHROPIC_API_KEY = "Sua chave aqui"
 
 
 def iniciar_chat():

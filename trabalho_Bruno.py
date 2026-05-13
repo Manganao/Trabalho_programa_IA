@@ -1,15 +1,28 @@
 """
 Diagnóstico de Problemas Mecânicos em Automóveis
-API: Anthropic (Claude)
+API: Anthropic (Claude) via LangChain
 Banco de dados: PostgreSQL
+
+ALTERAÇÕES REALIZADAS:
+- Substituído o cliente 'anthropic' diretamente pelo wrapper LangChain 'ChatAnthropic'
+- Substituído client.messages.create() por chains LangChain (prompt | llm)
+- Adicionado ChatPromptTemplate para estruturar os prompts de forma declarativa
+- Adicionado SystemMessage / HumanMessage para o histórico de conversa no chat
+- O histórico de conversa agora usa objetos de mensagem LangChain em vez de dicts simples
 """
 
-import anthropic
+# ──────────────────────────────────────────────
+# ALTERAÇÃO: importações do LangChain substituem
+# o SDK nativo da Anthropic para chamadas à IA
+# ──────────────────────────────────────────────
+from langchain_anthropic import ChatAnthropic          # Substitui: anthropic.Anthropic()
+from langchain_core.prompts import ChatPromptTemplate  # Substitui: strings de prompt manuais
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage  # Substitui: dicts {"role": ..., "content": ...}
+
 import psycopg2
 import os
 from dotenv import load_dotenv
 
-# Carrega as configurações do arquivo .env
 load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -22,6 +35,7 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", "")
 }
 
+# Prompts permanecem como strings — são passados ao ChatPromptTemplate
 SYSTEM_PROMPT_NORMAL = """Você é um mecânico especialista com mais de 20 anos de experiência em automóveis.
 Seu papel é diagnosticar problemas mecânicos com base nos sintomas descritos.
 
@@ -46,12 +60,11 @@ Formato obrigatório (fragmentos, sem frases completas):
 
 Sem cumprimentos. Sem explicações óbvias. Direto ao ponto. Português."""
 
-# Modo ativo: "normal" ou "caveman"
 MODO = "normal"
 
 
 # =============================================
-# CONEXÃO
+# CONEXÃO COM O BANCO (sem alterações)
 # =============================================
 def conectar():
     return psycopg2.connect(**DB_CONFIG)
@@ -66,7 +79,7 @@ def testar_conexao():
 
 
 # =============================================
-# CADASTROS
+# CADASTROS (sem alterações)
 # =============================================
 def cadastrar_cliente():
     print("\n── Cadastrar Cliente ──")
@@ -95,8 +108,6 @@ def listar_clientes():
 
 def cadastrar_veiculo():
     print("\n── Cadastrar Veículo ──")
-
-    # Lista clientes para escolher
     clientes = listar_clientes()
     if not clientes:
         print("Nenhum cliente cadastrado. Cadastre um cliente primeiro.")
@@ -108,11 +119,11 @@ def cadastrar_veiculo():
         print(f"  [{c[0]}] {c[1]} — {c[2]}")
 
     cliente_id = input("\nID do cliente: ").strip()
-    placa     = input("Placa: ").strip().upper()
-    marca     = input("Marca (ex: Volkswagen): ").strip()
-    modelo    = input("Modelo (ex: Gol): ").strip()
-    ano       = input("Ano: ").strip()
-    cor       = input("Cor: ").strip()
+    placa  = input("Placa: ").strip().upper()
+    marca  = input("Marca (ex: Volkswagen): ").strip()
+    modelo = input("Modelo (ex: Gol): ").strip()
+    ano    = input("Ano: ").strip()
+    cor    = input("Cor: ").strip()
 
     with conectar() as conn:
         with conn.cursor() as cur:
@@ -226,12 +237,20 @@ def salvar_diagnostico(veiculo_id, sintomas, resultado, urgencia):
 def extrair_urgencia(texto):
     t = texto.lower()
     if "crítica" in t or "critica" in t: return "critica"
-    if "alta" in t: return "alta"
-    if "média" in t or "media" in t: return "media"
+    if "alta" in t:                       return "alta"
+    if "média" in t or "media" in t:      return "media"
     return "baixa"
 
 
-def fazer_diagnostico(client):
+def fazer_diagnostico(llm):
+    """
+    ALTERAÇÃO: o parâmetro antes era 'client' (anthropic.Anthropic).
+    Agora é 'llm' (ChatAnthropic do LangChain).
+
+    A chamada direta à API foi substituída por uma chain LangChain:
+        prompt_template | llm
+    Isso permite trocar o modelo ou o provedor sem alterar o restante do código.
+    """
     print("\n── Diagnóstico por IA ──")
     placa = input("Placa do veículo: ").strip().upper()
 
@@ -255,16 +274,47 @@ def fazer_diagnostico(client):
     if not sintomas:
         return
 
-    prompt = SYSTEM_PROMPT_CAVEMAN if MODO == "caveman" else SYSTEM_PROMPT_NORMAL
-    print(f"\n⏳ Analisando... (modo: {MODO})\n")
-    resposta = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1024,
-        system=prompt,
-        messages=[{"role": "user", "content": f"Veículo: {v_marca} {v_modelo} {v_ano}\nSintomas: {sintomas}"}]
-    )
+    # ──────────────────────────────────────────────────────────────
+    # ALTERAÇÃO: construção do prompt com ChatPromptTemplate
+    #
+    # Antes (SDK nativo):
+    #   resposta = client.messages.create(
+    #       model="claude-haiku-4-5-20251001",
+    #       max_tokens=1024,
+    #       system=prompt,
+    #       messages=[{"role": "user", "content": f"Veículo: ..."}]
+    #   )
+    #   resultado = resposta.content[0].text
+    #
+    # Agora (LangChain):
+    #   - ChatPromptTemplate.from_messages() declara a estrutura do prompt
+    #   - A chain (prompt_template | llm) é invocada com .invoke()
+    #   - O resultado já vem como objeto AIMessage; .content extrai o texto
+    # ──────────────────────────────────────────────────────────────
+    system_prompt = SYSTEM_PROMPT_CAVEMAN if MODO == "caveman" else SYSTEM_PROMPT_NORMAL
 
-    resultado = resposta.content[0].text
+    # Cria o template com mensagem de sistema e mensagem do usuário
+    prompt_template = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("human", "Veículo: {marca} {modelo} {ano}\nSintomas: {sintomas}")
+    ])
+
+    # Compõe a chain: template → modelo
+    chain = prompt_template | llm
+
+    print(f"\n⏳ Analisando... (modo: {MODO})\n")
+
+    # Invoca a chain passando as variáveis do template
+    resposta = chain.invoke({
+        "marca": v_marca,
+        "modelo": v_modelo,
+        "ano": v_ano,
+        "sintomas": sintomas
+    })
+
+    # ALTERAÇÃO: antes era resposta.content[0].text (SDK Anthropic)
+    # Agora é resposta.content (atributo do AIMessage do LangChain)
+    resultado = resposta.content
     urgencia  = extrair_urgencia(resultado)
 
     print(f"🔍 Diagnóstico:\n\n{resultado}\n")
@@ -278,18 +328,33 @@ def fazer_diagnostico(client):
 def menu():
     print("=" * 55)
     print("   🔧 OFICINA MECÂNICA — Sistema de Diagnóstico")
-    print("   Powered by Claude (Anthropic) + PostgreSQL")
+    print("   Powered by Claude (via LangChain) + PostgreSQL")
     print("=" * 55)
 
     if not testar_conexao():
         return
     print("✅ Banco conectado!")
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    print("✅ API conectada!\n")
+    # ──────────────────────────────────────────────────────────────
+    # ALTERAÇÃO: instanciação do modelo
+    #
+    # Antes (SDK nativo):
+    #   client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    #
+    # Agora (LangChain):
+    #   llm = ChatAnthropic(...)
+    #   O wrapper LangChain gerencia a autenticação e a chamada HTTP.
+    #   max_tokens é definido aqui, não em cada chamada.
+    # ──────────────────────────────────────────────────────────────
+    llm = ChatAnthropic(
+        model="claude-haiku-4-5-20251001",
+        api_key=ANTHROPIC_API_KEY,
+        max_tokens=1024
+    )
+    print("✅ Modelo LangChain (ChatAnthropic) pronto!\n")
 
     opcoes = {
-        "1": ("🔍 Fazer diagnóstico com IA",  lambda: fazer_diagnostico(client)),
+        "1": ("🔍 Fazer diagnóstico com IA",  lambda: fazer_diagnostico(llm)),
         "2": ("👤 Cadastrar cliente",          cadastrar_cliente),
         "3": ("🚗 Cadastrar veículo",          cadastrar_veiculo),
         "4": ("🔩 Cadastrar peça no estoque",  cadastrar_peca),
@@ -328,70 +393,82 @@ def menu():
 
 if __name__ == "__main__":
     menu()
+
+
+# ==============================================================================
+# CHATBOT SIMPLES COM HISTÓRICO — também adaptado para LangChain
+# ==============================================================================
 """
-Atividade: Configurar ambiente e validar comunicação com API de IA
-API utilizada: Anthropic (Claude)
-Documentação: https://docs.anthropic.com
+ALTERAÇÕES NO CHATBOT:
+- Substituído anthropic.Anthropic() por ChatAnthropic do LangChain
+- O histórico de conversa agora usa objetos SystemMessage / HumanMessage / AIMessage
+  em vez de dicts {"role": "user"/"assistant", "content": "..."}
+- A chamada client.messages.create() foi substituída por llm.invoke(historico)
+- O texto da resposta é acessado via resposta.content (AIMessage) em vez de
+  resposta.content[0].text (SDK nativo)
 """
-
-import anthropic
-
-# =============================================
-# CONFIGURAÇÃO
-# Substitua pela sua chave de API da Anthropic
-# Obtenha em: https://console.anthropic.com/
-# =============================================
-ANTHROPIC_API_KEY = "Sua chave aqui"
-
 
 def iniciar_chat():
-    """Inicia um chat interativo com o Claude via API da Anthropic."""
+    """Inicia um chat interativo com o Claude via LangChain."""
 
-    # Instancia o cliente com a chave de API
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    # ALTERAÇÃO: ChatAnthropic substitui anthropic.Anthropic()
+    llm = ChatAnthropic(
+        model="claude-haiku-4-5-20251001",
+        api_key=ANTHROPIC_API_KEY,
+        max_tokens=1024
+    )
 
     print("=" * 50)
-    print("  Conexão com API da Anthropic (Claude)")
+    print("  Conexão com API da Anthropic via LangChain")
     print("=" * 50)
-
-    # Valida a conexão listando o modelo usado
     print("\n✅ Conexão estabelecida com sucesso!")
     print("   model=claude-haiku-4-5-20251001")
     print("   Status: Online\n")
-
     print("   /caveman — ativa o modo padrão (full)")
     print("   /caveman lite — versão menos agressiva")
     print("   /caveman ultra — compressão máxima")
 
-
-    historico = []
-    contexto = "Responda as perguntas apenas em português."
-    historico.append({"role": "user", "content": contexto})
-    historico.append({"role": "assistant", "content": "Entendido! Responderei apenas em português."})
+    # ──────────────────────────────────────────────────────────────
+    # ALTERAÇÃO: histórico agora usa objetos de mensagem LangChain
+    #
+    # Antes:
+    #   historico = [
+    #       {"role": "user",      "content": "Responda apenas em português."},
+    #       {"role": "assistant", "content": "Entendido!"}
+    #   ]
+    #
+    # Agora:
+    #   historico = [
+    #       SystemMessage(content="..."),   ← instrução de sistema
+    #       HumanMessage(content="..."),    ← mensagem do usuário
+    #       AIMessage(content="...")        ← resposta do modelo
+    #   ]
+    # ──────────────────────────────────────────────────────────────
+    historico = [
+        SystemMessage(content="Responda as perguntas apenas em português."),
+        HumanMessage(content="Entendido?"),
+        AIMessage(content="Entendido! Responderei apenas em português.")
+    ]
 
     print("Digite 'sair' para encerrar.\n")
-
     pergunta = input("Faça uma pergunta: ")
 
     while pergunta.lower() != "sair":
-        historico.append({"role": "user", "content": pergunta})
+        # Adiciona a mensagem do usuário ao histórico como HumanMessage
+        historico.append(HumanMessage(content=pergunta))
 
-        resposta = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
-            messages=historico,
-        )
+        # ALTERAÇÃO: antes era client.messages.create(messages=historico)
+        # Agora é llm.invoke(historico) — mais simples e idiomático no LangChain
+        resposta = llm.invoke(historico)
 
-        texto_resposta = resposta.content[0].text
-        historico.append({"role": "assistant", "content": texto_resposta})
+        # ALTERAÇÃO: antes era resposta.content[0].text (SDK Anthropic)
+        # Agora é resposta.content (string direta no AIMessage do LangChain)
+        texto_resposta = resposta.content
+
+        # Adiciona a resposta ao histórico como AIMessage para manter contexto
+        historico.append(AIMessage(content=texto_resposta))
 
         print(f"\nClaude: {texto_resposta}\n")
         pergunta = input("Faça uma pergunta ou digite sair para encerrar: ")
 
     print("\nEncerrando... Até mais!")
-
-
-if __name__ == "__main__":
-    iniciar_chat()
-
-   
